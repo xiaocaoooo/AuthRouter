@@ -1,0 +1,117 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  # 允许手动触发工作流
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  docker-build:
+    name: Docker Build and Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          load: true
+          tags: auth-router:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Test Docker image
+        run: |
+          # 启动容器进行测试
+          docker run -d --name auth-router -p 8000:8000 auth-router:latest
+
+          # 等待服务启动
+          sleep 10
+
+          # 打印容器的日志以进行调试
+          echo "---- Docker Container Logs ----"
+          docker logs auth-router
+          echo "-------------------------------"
+
+          # 测试API是否正常运行
+          curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/health | grep -q 200
+          result=$?
+
+          # 清理测试容器
+          docker stop auth-router
+          docker rm auth-router
+
+          # 返回测试结果
+          exit $result
+
+  deploy:
+    name: Deploy (Manual)
+    needs: docker-build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/auth-router
+          tags: |
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Create GitHub Release
+        if: success() && github.ref == 'refs/heads/main'
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ github.run_number }}
+          release_name: Release v${{ github.run_number }}
+          body: |
+            What's Changed:
+            - ${{ github.event.head_commit.message }}
+
+            Automated release for commit ${{ github.sha }}
+
+            **Docker Images:**
+            - ${{ secrets.DOCKERHUB_USERNAME }}/auth-router:latest
+            - ${{ secrets.DOCKERHUB_USERNAME }}/auth-router:${{ steps.meta.outputs.version }}
+          draft: false
+          prerelease: false
